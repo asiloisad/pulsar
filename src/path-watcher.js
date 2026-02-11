@@ -1,18 +1,10 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const { Emitter, Disposable, CompositeDisposable } = require('event-kit');
-const nsfw = require('nsfw');
 const { NativeWatcherRegistry } = require('./native-watcher-registry');
-
-// Private: Associate native watcher action flags with descriptive String
-// equivalents.
-const ACTION_MAP = new Map([
-  [nsfw.actions.MODIFIED, 'modified'],
-  [nsfw.actions.CREATED,  'created' ],
-  [nsfw.actions.DELETED,  'deleted' ],
-  [nsfw.actions.RENAMED,  'renamed' ]
-]);
+const Task = require('./task');
 
 // Private: Possible states of a {NativeWatcher}.
 const WATCHER_STATE = {
@@ -168,45 +160,194 @@ class NativeWatcher {
   }
 }
 
-// Private: Implement a native watcher by translating events from an NSFW
-// watcher.
-class NSFWNativeWatcher extends NativeWatcher {
-  async doStart(_rootPath, _eventCallback, _errorCallback) {
-    const handler = events => {
-      this.onEvents(
-        events.map(event => {
-          const action =
-            ACTION_MAP.get(event.action) || `unexpected (${event.action})`;
-          const payload = { action };
+// Private: Timeout in ms for worker IPC requests. If the worker doesn't
+// respond within this time, the promise is rejected.
+const SEND_TIMEOUT = 30000;
 
-          if (event.file) {
-            payload.path = path.join(event.directory, event.file);
-          } else {
-            payload.oldPath = path.join(
-              event.directory,
-              typeof event.oldFile === 'undefined' ? '' : event.oldFile
-            );
-            payload.path = path.join(
-              event.directory,
-              typeof event.newFile === 'undefined' ? '' : event.newFile
-            );
-          }
+// Private: Implement a native watcher backed by `@parcel/watcher` running in a
+// separate worker process. The worker isolates the native module from the
+// renderer process to prevent crashes on window reload.
+class ParcelNativeWatcher extends NativeWatcher {
+  static task = new Task(require.resolve('./parcel-watcher-worker.js'));
 
-          return payload;
-        })
-      );
-    };
+  // Whether the task has been started.
+  static started = false;
 
-    this.watcher = await nsfw(this.normalizedPath, handler, {
-      debounceMS: 100,
-      errorCallback: this.onError
-    });
+  // Whether the task has had its listeners attached.
+  static initialized = false;
 
-    await this.watcher.start();
+  // Job IDs for request/response cycles.
+  static PROMISE_META = new Map();
+
+  // All instances of this watcher organized by unique ID.
+  static INSTANCES = new Map();
+
+  static register(instance) {
+    this.initialize();
+    this.INSTANCES.set(instance.id, instance);
   }
 
-  doStop() {
-    return this.watcher.stop();
+  static unregister(instance) {
+    this.INSTANCES.delete(instance.id);
+    if (this.INSTANCES.size === 0) {
+      this.task.terminate();
+      this.started = false;
+      this.initialized = false;
+      // Once a task is terminated, it cannot be started again. We have to
+      // replace it with a new instance.
+      this.task = new Task(require.resolve('./parcel-watcher-worker.js'));
+      this.PROMISE_META.clear();
+      this.initialize();
+    }
+  }
+
+  static initialize() {
+    if (this.initialized) return;
+
+    // Emitted when the worker responds to a method call.
+    this.task.on('watcher:reply', ({ id, args, error }) => {
+      let meta = this.PROMISE_META.get(id);
+      if (!meta) return;
+      clearTimeout(meta.timer);
+      if (error) {
+        meta.reject(new Error(error));
+      } else {
+        meta.resolve(args);
+      }
+      this.PROMISE_META.delete(id);
+    });
+
+    // Emitted when the worker pushes events.
+    this.task.on('watcher:events', ({ id, events }) => {
+      let instance = this.INSTANCES.get(id);
+      instance?.onEvents(events);
+    });
+
+    // Emitted when the worker pushes a watcher error.
+    this.task.on('watcher:error', ({ id, error }) => {
+      let instance = this.INSTANCES.get(id);
+      instance?.onError(new Error(error));
+    });
+
+    // Emitted when the worker is created and ready to receive method calls.
+    this.task.on('watcher:ready', () => {
+      this.PROMISE_META.get('self:start')?.resolve?.();
+    });
+
+    // Logging from the worker.
+    this.task.on('console:log', (args) => {
+      console.log(...args);
+    });
+
+    this.task.on('console:warn', (args) => {
+      console.warn(...args);
+    });
+
+    this.task.on('console:error', (args) => {
+      console.error(...args);
+    });
+
+    this.initialized = true;
+  }
+
+  static async startTask() {
+    let meta = this.PROMISE_META.get('self:start');
+    if (!meta) {
+      meta = {};
+      let promise = new Promise((resolve, reject) => {
+        meta.resolve = resolve;
+        meta.reject = reject;
+        this.task.start();
+      });
+      meta.promise = promise;
+      this.PROMISE_META.set('self:start', meta);
+    }
+    await meta.promise;
+    this.started = true;
+  }
+
+  static async sendEvent(event, args) {
+    let id = this.getID();
+    let bundle = { id, event, args };
+    let meta = {};
+    let promise = new Promise((resolve, reject) => {
+      meta.resolve = resolve;
+      meta.reject = reject;
+      meta.timer = setTimeout(() => {
+        this.PROMISE_META.delete(id);
+        reject(new Error(`Watcher worker did not respond within ${SEND_TIMEOUT}ms`));
+      }, SEND_TIMEOUT);
+    });
+    meta.promise = promise;
+    this.PROMISE_META.set(id, meta);
+    this.task.send(JSON.stringify(bundle));
+    return await promise;
+  }
+
+  // Both instances and jobs have randomly-generated IDs. We use the job IDs
+  // for standard request/response cycles initiated by the renderer. We use
+  // the instance IDs for worker-initiated pushes that are routed directly
+  // to the corresponding watcher instance.
+  static getID() {
+    let id;
+    do {
+      id = crypto.randomBytes(5).toString('hex');
+    } while (this.INSTANCES.has(id) || this.PROMISE_META.has(id));
+    return id;
+  }
+
+  dispose() {
+    super.dispose();
+    this.subs.dispose();
+    this.constructor.unregister(this);
+  }
+
+  constructor(...args) {
+    super(...args);
+    this.id = this.constructor.getID();
+
+    this.subs.add(
+      atom.config.observe('core.ignoredNames', (newValue) => {
+        this.setIgnoredNames(newValue);
+      })
+    );
+  }
+
+  async send(event, args) {
+    await this.constructor.sendEvent(event, args);
+  }
+
+  setIgnoredNames(ignoredNames) {
+    this.ignoredNames = ignoredNames;
+    if (this.state === WATCHER_STATE.RUNNING) {
+      this.send('watcher:update', {
+        normalizedPath: this.normalizedPath,
+        instance: this.id,
+        ignored: this.ignoredNames
+      });
+    }
+  }
+
+  async doStart() {
+    this.constructor.register(this);
+    if (!ParcelNativeWatcher.started) {
+      await ParcelNativeWatcher.startTask();
+    }
+
+    return await this.send('watcher:watch', {
+      normalizedPath: this.normalizedPath,
+      instance: this.id,
+      ignored: this.ignoredNames
+    });
+  }
+
+  async doStop() {
+    let result = await this.send('watcher:unwatch', {
+      normalizedPath: this.normalizedPath,
+      instance: this.id
+    });
+    this.constructor.unregister(this);
+    return result;
   }
 }
 
@@ -529,7 +670,7 @@ class PathWatcher {
 }
 
 // Private: Globally tracked state used to de-duplicate related
-// [PathWatchers]{PathWatcher} backed by emulated Pulsar events or NSFW.
+// [PathWatchers]{PathWatcher} backed by a native watcher implementation.
 class PathWatcherManager {
   // Private: Access the currently active manager instance, creating one if
   // necessary.
@@ -589,7 +730,7 @@ class PathWatcherManager {
     this.live = new Map();
 
     this.nativeRegistry = new NativeWatcherRegistry(normalizedPath => {
-      const nativeWatcher = new NSFWNativeWatcher(normalizedPath);
+      const nativeWatcher = new ParcelNativeWatcher(normalizedPath);
 
       this.live.set(normalizedPath, nativeWatcher);
       const sub = nativeWatcher.onWillStop(() => {
