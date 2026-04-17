@@ -51,6 +51,18 @@ module.exports = function start(resourcePath, devResourcePath, startTime) {
   // dump path.
   app.setPath('crashDumps', path.resolve(process.env.ATOM_HOME, 'crashdumps'))
 
+  // Redirect Chromium's base logger (LOG(ERROR) etc.) away from the current
+  // working directory. Without this, any ERROR-level log from a Chromium
+  // child process gets written to a file literally named `debug.log` in
+  // whatever cwd Pulsar was launched from -- typically a project folder
+  // opened via Explorer, a file manager, or a jumplist. The most common
+  // offender is a benign crashpad pipe-registration race at startup, which
+  // produces a single-line `debug.log` on every launch. Setting
+  // CHROME_LOG_FILE before any child process is forked is inherited by every
+  // renderer/GPU/utility process, keeping these logs inside ATOM_HOME. See
+  // `base::logging::BaseInitLoggingImpl` in Chromium.
+  process.env.CHROME_LOG_FILE ??= path.resolve(process.env.ATOM_HOME, 'chrome-debug.log');
+
   // By default, we're using the crash reporter on Windows and Linux, but not
   // macOS. That's because:
   //
